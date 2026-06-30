@@ -1,7 +1,6 @@
 import os
 import json
 import requests
-import sqlite3
 from datetime import datetime
 from playwright.sync_api import sync_playwright
 
@@ -11,10 +10,22 @@ CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 REGIONS = ["부산", "양산", "김해"]
 KEYWORDS = ["승강기", "엘리베이터"]
 
-DB_FILE = "sent_notice.db"
+SENT_FILE = "sent_notice.json"
 
 
-def send_telegram(message, link="https://www.k-apt.go.kr/bid/bidList.do"):
+def load_sent():
+    if not os.path.exists(SENT_FILE):
+        return {}
+    with open(SENT_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_sent(sent_data):
+    with open(SENT_FILE, "w", encoding="utf-8") as f:
+        json.dump(sent_data, f, ensure_ascii=False, indent=2)
+
+
+def send_telegram(message, link):
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
 
     keyboard = {
@@ -23,44 +34,13 @@ def send_telegram(message, link="https://www.k-apt.go.kr/bid/bidList.do"):
         ]
     }
 
-    requests.post(url, data={
+    response = requests.post(url, data={
         "chat_id": CHAT_ID,
         "text": message,
-        "reply_markup": json.dumps(keyboard)
+        "reply_markup": json.dumps(keyboard, ensure_ascii=False)
     })
 
-
-def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS sent_notice (
-            notice_id TEXT PRIMARY KEY,
-            sent_at TEXT
-        )
-    """)
-    conn.commit()
-    conn.close()
-
-
-def is_sent(notice_id):
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute("SELECT notice_id FROM sent_notice WHERE notice_id = ?", (notice_id,))
-    result = cur.fetchone()
-    conn.close()
-    return result is not None
-
-
-def save_sent(notice_id):
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT OR IGNORE INTO sent_notice VALUES (?, ?)",
-        (notice_id, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-    )
-    conn.commit()
-    conn.close()
+    print("텔레그램 응답:", response.status_code)
 
 
 def make_message(text):
@@ -116,6 +96,9 @@ def get_row_link(row):
 def check_kapt():
     print("K-apt 확인 시작")
 
+    sent_data = load_sent()
+    new_sent = 0
+
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
@@ -124,8 +107,6 @@ def check_kapt():
 
         rows = page.locator("table tbody tr")
         print(f"공고 {rows.count()}개 확인")
-
-        sent_count = 0
 
         for i in range(rows.count()):
             row = rows.nth(i)
@@ -139,7 +120,7 @@ def check_kapt():
 
             notice_id = text.split("\n")[0].strip()
 
-            if is_sent(notice_id):
+            if notice_id in sent_data:
                 print(f"이미 보낸 공고: {notice_id}")
                 continue
 
@@ -147,16 +128,22 @@ def check_kapt():
             message = make_message(text)
 
             send_telegram(message, link)
-            save_sent(notice_id)
 
-            sent_count += 1
-            print(f"전송 완료: {notice_id}")
+            sent_data[notice_id] = {
+                "sent_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "text": text,
+                "link": link
+            }
+
+            new_sent += 1
+            print(f"신규 전송 완료: {notice_id}")
 
         browser.close()
 
-        if sent_count == 0:
-            print("새로 보낼 공고 없음")
+    save_sent(sent_data)
+
+    if new_sent == 0:
+        print("새로 보낼 공고 없음")
 
 
-init_db()
 check_kapt()
