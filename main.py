@@ -16,8 +16,12 @@ SENT_FILE = "sent_notice.json"
 def load_sent():
     if not os.path.exists(SENT_FILE):
         return {}
-    with open(SENT_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+
+    try:
+        with open(SENT_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except:
+        return {}
 
 
 def save_sent(sent_data):
@@ -25,7 +29,7 @@ def save_sent(sent_data):
         json.dump(sent_data, f, ensure_ascii=False, indent=2)
 
 
-def send_telegram(message, link):
+def send_telegram(message, link="https://www.k-apt.go.kr/bid/bidList.do"):
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
 
     keyboard = {
@@ -102,20 +106,24 @@ def check_kapt():
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
-        page.goto(
-        "https://www.k-apt.go.kr/bid/bidList.do",
-        wait_until="domcontentloaded",
-        timeout=120000
-    )
-except TimeoutError:
-    print("K-apt 로딩 지연됨. 현재 로드된 화면으로 계속 진행합니다.")
 
-page.wait_for_timeout(10000)
+        try:
+            page.goto(
+                "https://www.k-apt.go.kr/bid/bidList.do",
+                wait_until="domcontentloaded",
+                timeout=120000
+            )
+        except TimeoutError:
+            print("K-apt 로딩 지연됨. 현재 로드된 화면으로 계속 진행합니다.")
+
+        page.wait_for_timeout(10000)
 
         rows = page.locator("table tbody tr")
-        print(f"공고 {rows.count()}개 확인")
+        count = rows.count()
 
-        for i in range(rows.count()):
+        print(f"공고 {count}개 확인")
+
+        for i in range(count):
             row = rows.nth(i)
             text = row.inner_text()
 
@@ -151,8 +159,6 @@ page.wait_for_timeout(10000)
 
     if new_sent == 0:
         print("새로 보낼 공고 없음")
-
-
 
 
 check_kapt()
