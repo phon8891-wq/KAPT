@@ -147,8 +147,5 @@ def check_kapt():
 
 
 
-send_telegram(
-    "✅ GitHub Actions 테스트 성공!",
-    "https://www.k-apt.go.kr/bid/bidList.do"
-)
+
 check_kapt()
