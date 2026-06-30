@@ -11,6 +11,7 @@ REGIONS = ["부산", "양산", "김해"]
 KEYWORDS = ["승강기", "엘리베이터"]
 
 SENT_FILE = "sent_notice.json"
+KAPT_URL = "https://www.k-apt.go.kr/bid/bidList.do"
 
 
 def load_sent():
@@ -29,7 +30,7 @@ def save_sent(sent_data):
         json.dump(sent_data, f, ensure_ascii=False, indent=2)
 
 
-def send_telegram(message, link="https://www.k-apt.go.kr/bid/bidList.do"):
+def send_telegram(message, link=KAPT_URL):
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
 
     keyboard = {
@@ -83,8 +84,6 @@ def make_message(text):
 
 
 def get_row_link(row):
-    default_link = "https://www.k-apt.go.kr/bid/bidList.do"
-
     try:
         href = row.locator("a").first.get_attribute("href")
         if href:
@@ -94,7 +93,7 @@ def get_row_link(row):
     except:
         pass
 
-    return default_link
+    return KAPT_URL
 
 
 def check_kapt():
@@ -109,14 +108,20 @@ def check_kapt():
 
         try:
             page.goto(
-                "https://www.k-apt.go.kr/bid/bidList.do",
+                KAPT_URL,
                 wait_until="domcontentloaded",
                 timeout=120000
             )
         except TimeoutError:
             print("K-apt 로딩 지연됨. 현재 로드된 화면으로 계속 진행합니다.")
 
-        page.wait_for_timeout(10000)
+        try:
+            page.wait_for_selector("table tbody tr", timeout=60000)
+            page.wait_for_timeout(3000)
+        except TimeoutError:
+            print("공고 목록 로딩 실패")
+            browser.close()
+            return
 
         rows = page.locator("table tbody tr")
         count = rows.count()
