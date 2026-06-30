@@ -145,7 +145,7 @@ def check_kapt():
     if new_sent == 0:
         print("새로 보낼 공고 없음")
 
-init_db()
+
 
 send_telegram(
     "✅ GitHub Actions 테스트 성공!",
