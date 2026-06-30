@@ -102,7 +102,11 @@ def check_kapt():
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
-        page.goto("https://www.k-apt.go.kr/bid/bidList.do")
+        page.goto(
+    "https://www.k-apt.go.kr/bid/bidList.do",
+    wait_until="domcontentloaded",
+    timeout=60000
+)
         page.wait_for_timeout(5000)
 
         rows = page.locator("table tbody tr")
