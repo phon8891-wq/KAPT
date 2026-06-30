@@ -2,7 +2,7 @@ import os
 import json
 import requests
 from datetime import datetime
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright, TimeoutError
 
 TOKEN = os.environ["TELEGRAM_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
@@ -103,11 +103,14 @@ def check_kapt():
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
         page.goto(
-    "https://www.k-apt.go.kr/bid/bidList.do",
-    wait_until="domcontentloaded",
-    timeout=60000
-)
-        page.wait_for_timeout(5000)
+        "https://www.k-apt.go.kr/bid/bidList.do",
+        wait_until="domcontentloaded",
+        timeout=120000
+    )
+except TimeoutError:
+    print("K-apt 로딩 지연됨. 현재 로드된 화면으로 계속 진행합니다.")
+
+page.wait_for_timeout(10000)
 
         rows = page.locator("table tbody tr")
         print(f"공고 {rows.count()}개 확인")
