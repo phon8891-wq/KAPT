@@ -1,169 +1,119 @@
-import os
-import json
-import requests
-from datetime import datetime
-from playwright.sync_api import sync_playwright, TimeoutError
+import os, json, requests
+from datetime import datetime, timedelta
+from urllib.parse import quote
 
-TOKEN = os.environ["TELEGRAM_TOKEN"]
+SERVICE_KEY = os.environ["KAPT_SERVICE_KEY"]
+BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
-REGIONS = ["부산", "양산", "김해"]
-KEYWORDS = ["승강기", "엘리베이터"]
-
 SENT_FILE = "sent_notice.json"
-KAPT_URL = "https://www.k-apt.go.kr/bid/bidList.do"
 
+KEYWORDS = ["승강기", "엘리베이터", "elevator", "리프트"]
+AREAS = ["부산", "양산", "김해"]
+
+API_URL = "http://apis.data.go.kr/1613000/AptBidInfoService/getBidInfo"
 
 def load_sent():
     if not os.path.exists(SENT_FILE):
-        return {}
+        return set()
+    with open(SENT_FILE, "r", encoding="utf-8") as f:
+        return set(json.load(f))
 
-    try:
-        with open(SENT_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except:
-        return {}
-
-
-def save_sent(sent_data):
+def save_sent(sent):
     with open(SENT_FILE, "w", encoding="utf-8") as f:
-        json.dump(sent_data, f, ensure_ascii=False, indent=2)
+        json.dump(list(sent)[-1000:], f, ensure_ascii=False, indent=2)
 
+def get_notices():
+    today = datetime.now()
+    start = (today - timedelta(days=7)).strftime("%Y%m%d")
+    end = (today + timedelta(days=30)).strftime("%Y%m%d")
 
-def send_telegram(message, link=KAPT_URL):
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-
-    keyboard = {
-        "inline_keyboard": [
-            [{"text": "🔗 공고 바로가기", "url": link}]
-        ]
+    params = {
+        "serviceKey": SERVICE_KEY,
+        "pageNo": 1,
+        "numOfRows": 100,
+        "type": "json",
+        "bidStartDate": start,
+        "bidEndDate": end,
     }
 
-    response = requests.post(url, data={
-        "chat_id": CHAT_ID,
-        "text": message,
-        "reply_markup": json.dumps(keyboard, ensure_ascii=False)
-    })
+    r = requests.get(API_URL, params=params, timeout=20)
+    print("API status:", r.status_code)
+    print("API preview:", r.text[:500])
+    r.raise_for_status()
 
-    print("텔레그램 응답:", response.status_code)
+    data = r.json()
+    body = data.get("response", {}).get("body", {})
+    items = body.get("items", {}).get("item", [])
 
+    if isinstance(items, dict):
+        items = [items]
 
-def make_message(text):
-    lines = text.split("\n")
+    return items
 
-    notice_id = lines[0].strip() if len(lines) > 0 else ""
-    bid_method = lines[2].strip() if len(lines) > 2 else ""
-    title = lines[3].strip() if len(lines) > 3 else ""
-    deadline = lines[4].strip() if len(lines) > 4 else ""
-    status = lines[5].strip() if len(lines) > 5 else ""
-    complex_name = lines[6].strip() if len(lines) > 6 else ""
-    posted_at = lines[7].strip() if len(lines) > 7 else ""
+def text_of(item):
+    return " ".join(str(v) for v in item.values() if v)
 
-    return f"""🔔 신규 승강기/엘리베이터 공고
+def is_target(item):
+    text = text_of(item).lower()
+    has_keyword = any(k.lower() in text for k in KEYWORDS)
+    has_area = any(a in text for a in AREAS)
+    return has_keyword and has_area
 
-🏢 단지명
-{complex_name}
+def notice_id(item):
+    for key in ["bidNo", "bidNum", "bidTitle", "id"]:
+        if item.get(key):
+            return str(item.get(key))
+    return str(hash(text_of(item)))
 
-📋 공고명
-{title}
+def send_telegram(item):
+    title = item.get("bidTitle") or item.get("title") or "K-apt 공고"
+    apt = item.get("aptName") or item.get("kaptName") or ""
+    area = item.get("bidArea") or item.get("addr") or ""
+    date = item.get("bidEndDate") or item.get("endDate") or ""
 
-📌 입찰방식
-{bid_method}
+    msg = f"""🚨 K-apt 승강기 공고 알림
 
-⏰ 마감일
-{deadline}
+공고명: {title}
+단지명: {apt}
+지역: {area}
+마감일: {date}
 
-📅 공고일
-{posted_at}
-
-📎 상태
-{status}
-
-공고번호: {notice_id}
+K-apt에서 상세 확인하세요.
+https://www.k-apt.go.kr/
 """
 
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    res = requests.post(url, data={"chat_id": CHAT_ID, "text": msg}, timeout=20)
+    print("Telegram:", res.status_code, res.text[:300])
+    res.raise_for_status()
 
-def get_row_link(row):
-    try:
-        href = row.locator("a").first.get_attribute("href")
-        if href:
-            if href.startswith("http"):
-                return href
-            return "https://www.k-apt.go.kr" + href
-    except:
-        pass
+def main():
+    print("K-apt 공공API 확인 시작")
 
-    return KAPT_URL
+    sent = load_sent()
+    notices = get_notices()
 
+    print("가져온 공고 수:", len(notices))
 
-def check_kapt():
-    print("K-apt 확인 시작")
+    new_count = 0
 
-    sent_data = load_sent()
-    new_sent = 0
+    for item in notices:
+        nid = notice_id(item)
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
+        if nid in sent:
+            continue
 
-        try:
-            page.goto(
-                KAPT_URL,
-                wait_until="domcontentloaded",
-                timeout=120000
-            )
-        except TimeoutError:
-            print("K-apt 로딩 지연됨. 현재 로드된 화면으로 계속 진행합니다.")
+        if is_target(item):
+            print("대상 공고 발견:", item)
+            send_telegram(item)
+            new_count += 1
 
-        try:
-            page.wait_for_selector("table tbody tr", timeout=60000)
-            page.wait_for_timeout(3000)
-        except TimeoutError:
-            print("공고 목록 로딩 실패")
-            browser.close()
-            return
+        sent.add(nid)
 
-        rows = page.locator("table tbody tr")
-        count = rows.count()
+    save_sent(sent)
+    print("새 알림 수:", new_count)
+    print("완료")
 
-        print(f"공고 {count}개 확인")
-
-        for i in range(count):
-            row = rows.nth(i)
-            text = row.inner_text()
-
-            region_ok = any(region in text for region in REGIONS)
-            keyword_ok = any(keyword in text for keyword in KEYWORDS)
-
-            if not (region_ok and keyword_ok):
-                continue
-
-            notice_id = text.split("\n")[0].strip()
-
-            if notice_id in sent_data:
-                print(f"이미 보낸 공고: {notice_id}")
-                continue
-
-            link = get_row_link(row)
-            message = make_message(text)
-
-            send_telegram(message, link)
-
-            sent_data[notice_id] = {
-                "sent_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "text": text,
-                "link": link
-            }
-
-            new_sent += 1
-            print(f"신규 전송 완료: {notice_id}")
-
-        browser.close()
-
-    save_sent(sent_data)
-
-    if new_sent == 0:
-        print("새로 보낼 공고 없음")
-
-
-check_kapt()
+if __name__ == "__main__":
+    main()
