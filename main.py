@@ -15,7 +15,10 @@ CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 SENT_FILE = "sent_notice.json"
 
 AREAS = ["부산", "양산", "김해"]
+AREA_CODES = ["26", "48"]
 KEYWORDS = ["승강기", "엘리베이터", "리프트", "승강"]
+SEARCH_KEYWORDS = ["승강기", "승강기교체", "엘리베이터"]
+
 NUM_OF_ROWS = 500
 
 
@@ -55,15 +58,15 @@ def request_api(url, params, label):
     print(f"{label} 요청")
     res = requests.get(url, params=params, timeout=30)
     print(f"{label} 상태코드:", res.status_code)
-    print(f"{label} 응답 미리보기:", res.text[:500])
+    print(f"{label} 미리보기:", res.text[:500])
     res.raise_for_status()
     return parse_items(res.json())
 
 
 def get_date_notices():
     today = datetime.now()
-    start_date = (today - timedelta(days=14)).strftime("%Y%m%d")
-    end_date = (today + timedelta(days=30)).strftime("%Y%m%d")
+    start_date = (today - timedelta(days=45)).strftime("%Y%m%d")
+    end_date = (today + timedelta(days=60)).strftime("%Y%m%d")
 
     params = {
         "serviceKey": SERVICE_KEY,
@@ -73,35 +76,32 @@ def get_date_notices():
         "numOfRows": str(NUM_OF_ROWS),
     }
 
-    print("조회기간:", start_date, "~", end_date)
+    print("공고일 조회기간:", start_date, "~", end_date)
     return request_api(DATE_API, params, "공고일 조회 API")
 
 
-def get_keyword_notices(keyword):
-    candidate_params = [
-        {"bidTitle": keyword},
-        {"bidPblancNm": keyword},
-        {"pblancNm": keyword},
-        {"bidNm": keyword},
-        {"searchKeyword": keyword},
-    ]
+def get_name_notices(keyword):
+    today = datetime.now()
+    start_date = (today - timedelta(days=45)).strftime("%Y%m%d")
+    end_date = (today + timedelta(days=60)).strftime("%Y%m%d")
 
-    for extra in candidate_params:
-        params = {
-            "serviceKey": SERVICE_KEY,
-            "pageNo": "1",
-            "numOfRows": str(NUM_OF_ROWS),
-            **extra,
-        }
+    params = {
+        "serviceKey": SERVICE_KEY,
+        "bidTitle": keyword,
+        "startDate": start_date,
+        "endDate": end_date,
+        "pageNo": "1",
+        "numOfRows": str(NUM_OF_ROWS),
+    }
 
-        try:
-            items = request_api(NAME_API, params, f"공고명 검색 API({keyword}/{list(extra.keys())[0]})")
-            if items:
-                return items
-        except Exception as e:
-            print("공고명 검색 실패:", keyword, extra, e)
+    return request_api(NAME_API, params, f"공고명 검색 API: {keyword}")
 
-    return []
+
+def get_notice_id(item):
+    for key in ["bidNum", "bidNo", "pblancNo"]:
+        if item.get(key):
+            return str(item.get(key))
+    return str(abs(hash(item_text(item))))
 
 
 def get_all_notices():
@@ -109,13 +109,15 @@ def get_all_notices():
 
     all_items.extend(get_date_notices())
 
-    for keyword in KEYWORDS:
-        all_items.extend(get_keyword_notices(keyword))
+    for keyword in SEARCH_KEYWORDS:
+        try:
+            all_items.extend(get_name_notices(keyword))
+        except Exception as e:
+            print("공고명 검색 실패:", keyword, e)
 
     unique = {}
     for item in all_items:
-        nid = get_notice_id(item)
-        unique[nid] = item
+        unique[get_notice_id(item)] = item
 
     return list(unique.values())
 
@@ -124,46 +126,74 @@ def item_text(item):
     return " ".join(str(v) for v in item.values() if v)
 
 
+def parse_date(value):
+    if not value:
+        return None
+
+    text = str(value).strip()[:10]
+
+    for fmt in ["%Y-%m-%d", "%Y%m%d"]:
+        try:
+            return datetime.strptime(text, fmt)
+        except Exception:
+            pass
+
+    return None
+
+
+def is_current_notice(item):
+    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+
+    reg_date = parse_date(item.get("bidRegDate") or item.get("bidDate"))
+    deadline = parse_date(item.get("bidDeadline") or item.get("bidCloseDate"))
+
+    if deadline and deadline < today:
+        return False
+
+    if reg_date and reg_date < today - timedelta(days=60):
+        return False
+
+    return True
+
+
 def is_target_notice(item):
     text = item_text(item).lower()
+    bid_area = str(item.get("bidArea", ""))
+
     area_match = any(area in text for area in AREAS)
+    area_code_match = bid_area in AREA_CODES
+
     keyword_match = any(keyword.lower() in text for keyword in KEYWORDS)
-    return area_match and keyword_match
 
-
-def get_notice_id(item):
-    for key in ["bidNum", "bidNo", "pblancNo", "bidTitle", "aptCode"]:
-        value = item.get(key)
-        if value:
-            return str(value)
-    return str(abs(hash(item_text(item))))
+    return (area_match or area_code_match) and keyword_match and is_current_notice(item)
 
 
 def get_value(item, keys, default=""):
     for key in keys:
-        value = item.get(key)
-        if value:
-            return str(value)
+        if item.get(key):
+            return str(item.get(key))
     return default
 
 
 def make_message(item):
-    title = get_value(item, ["bidTitle", "pblancNm", "title"], "제목 없음")
-    apt_name = get_value(item, ["bidKaptname", "aptNm", "aptName", "kaptName"], "단지명 없음")
-    bid_no = get_value(item, ["bidNum", "bidNo", "pblancNo"], "번호 없음")
-    area = get_value(item, ["bidArea", "addr", "address"], "")
-    bid_date = get_value(item, ["bidRegDate", "bidDate", "pblancDate"], "")
-    deadline = get_value(item, ["bidDeadline", "bidCloseDate", "endDate"], "")
-    content = get_value(item, ["bidContent", "content"], "")
+    title = get_value(item, ["bidTitle"], "제목 없음")
+    apt_name = get_value(item, ["bidKaptname", "aptNm", "aptName"], "단지명 없음")
+    bid_no = get_value(item, ["bidNum", "bidNo"], "번호 없음")
+    area = get_value(item, ["bidArea"], "")
+    status = get_value(item, ["bidState", "bidStatus"], "")
+    bid_date = get_value(item, ["bidRegDate", "bidDate"], "")
+    deadline = get_value(item, ["bidDeadline", "bidCloseDate"], "")
+    content = get_value(item, ["bidContent"], "")
 
-    if len(content) > 300:
-        content = content[:300] + "..."
+    if len(content) > 250:
+        content = content[:250] + "..."
 
-    return f"""🚨 K-apt 승강기 공고 알림
+    return f"""🛗 K-apt 승강기 공고 알림
 
 공고명: {title}
 단지명: {apt_name}
-지역: {area}
+지역코드: {area}
+상태: {status}
 공고번호: {bid_no}
 공고일: {bid_date}
 마감일: {deadline}
@@ -188,7 +218,7 @@ def send_telegram(message):
         timeout=30,
     )
     print("텔레그램 상태코드:", res.status_code)
-    print("텔레그램 응답:", res.text[:500])
+    print("텔레그램 응답:", res.text[:300])
     res.raise_for_status()
 
 
@@ -206,22 +236,23 @@ def main():
 
     for item in notices:
         notice_id = get_notice_id(item)
-
-        if notice_id in sent:
-            continue
+        text = item_text(item)
 
         print("-----------------------------------")
-        print("새 공고 확인:", notice_id)
-        print(item_text(item)[:700])
+        print("공고 확인:", notice_id)
+        print(text[:700])
+
+        if notice_id in sent:
+            print("이미 알림 보낸 공고. 제외.")
+            continue
 
         if is_target_notice(item):
             print("대상 공고 발견. 텔레그램 발송.")
             send_telegram(make_message(item))
+            sent.add(notice_id)
             new_alert_count += 1
         else:
-            print("조건 불일치. 알림 제외.")
-
-        sent.add(notice_id)
+            print("조건 불일치 또는 과거 공고. 알림 제외.")
 
     save_sent(sent)
 
