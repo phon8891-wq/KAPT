@@ -2,6 +2,7 @@ import os
 import json
 import requests
 from datetime import datetime, timedelta
+from urllib.parse import urlencode
 
 BASE_URL = "https://apis.data.go.kr/1613000/ApHusBidPblAncInfoOfferServiceV2"
 
@@ -63,10 +64,15 @@ def request_api(url, params, label):
     return parse_items(res.json())
 
 
-def get_date_notices():
+def get_date_range():
     today = datetime.now()
     start_date = (today - timedelta(days=45)).strftime("%Y%m%d")
     end_date = (today + timedelta(days=60)).strftime("%Y%m%d")
+    return start_date, end_date
+
+
+def get_date_notices():
+    start_date, end_date = get_date_range()
 
     params = {
         "serviceKey": SERVICE_KEY,
@@ -81,9 +87,7 @@ def get_date_notices():
 
 
 def get_name_notices(keyword):
-    today = datetime.now()
-    start_date = (today - timedelta(days=45)).strftime("%Y%m%d")
-    end_date = (today + timedelta(days=60)).strftime("%Y%m%d")
+    start_date, end_date = get_date_range()
 
     params = {
         "serviceKey": SERVICE_KEY,
@@ -95,6 +99,10 @@ def get_name_notices(keyword):
     }
 
     return request_api(NAME_API, params, f"공고명 검색 API: {keyword}")
+
+
+def item_text(item):
+    return " ".join(str(v) for v in item.values() if v)
 
 
 def get_notice_id(item):
@@ -120,10 +128,6 @@ def get_all_notices():
         unique[get_notice_id(item)] = item
 
     return list(unique.values())
-
-
-def item_text(item):
-    return " ".join(str(v) for v in item.values() if v)
 
 
 def parse_date(value):
@@ -162,7 +166,6 @@ def is_target_notice(item):
 
     area_match = any(area in text for area in AREAS)
     area_code_match = bid_area in AREA_CODES
-
     keyword_match = any(keyword.lower() in text for keyword in KEYWORDS)
 
     return (area_match or area_code_match) and keyword_match and is_current_notice(item)
@@ -175,34 +178,92 @@ def get_value(item, keys, default=""):
     return default
 
 
+def get_area_name(item):
+    text = item_text(item)
+    bid_area = str(item.get("bidArea", ""))
+
+    if "부산" in text or bid_area == "26":
+        return "부산"
+    if "양산" in text:
+        return "양산"
+    if "김해" in text:
+        return "김해"
+    if bid_area == "48":
+        return "경남"
+
+    return "지역 미확인"
+
+
+def make_detail_url(item):
+    title = get_value(item, ["bidTitle"], "")
+    bid_num = get_value(item, ["bidNum", "bidNo"], "")
+    apt_name = get_value(item, ["bidKaptname", "aptNm", "aptName"], "")
+    apt_code = get_value(item, ["aptCode"], "")
+    bid_area = get_value(item, ["bidArea"], "")
+
+    today = datetime.now()
+    date_start = (today - timedelta(days=30)).strftime("%Y-%m-%d")
+    date_end = today.strftime("%Y-%m-%d")
+
+    params = {
+        "pageSelect": "10",
+        "searchBidGb": "bid_gb_1",
+        "bidTitle": title,
+        "aptName": apt_name,
+        "searchDateGb": "reg",
+        "dateStart": date_start,
+        "dateEnd": date_end,
+        "dateArea": "1",
+        "bidState": "",
+        "codeAuth": "",
+        "codeWay": "",
+        "codeAuthSub": "",
+        "codeSucWay": "",
+        "codeClassifyType1": "",
+        "codeClassifyType2": "",
+        "codeClassifyType3": "",
+        "pageNo": "1",
+        "type": "4",
+        "bidArea": bid_area,
+        "bidNum": bid_num,
+        "bidNo": "",
+        "dTime": str(int(datetime.now().timestamp() * 1000)),
+        "mainKaptCode": "",
+        "aptCode": apt_code,
+    }
+
+    return "https://www.k-apt.go.kr/bid/bidDetail.do?" + urlencode(params)
+
+
 def make_message(item):
     title = get_value(item, ["bidTitle"], "제목 없음")
     apt_name = get_value(item, ["bidKaptname", "aptNm", "aptName"], "단지명 없음")
     bid_no = get_value(item, ["bidNum", "bidNo"], "번호 없음")
-    area = get_value(item, ["bidArea"], "")
+    area = get_area_name(item)
     status = get_value(item, ["bidState", "bidStatus"], "")
     bid_date = get_value(item, ["bidRegDate", "bidDate"], "")
     deadline = get_value(item, ["bidDeadline", "bidCloseDate"], "")
     content = get_value(item, ["bidContent"], "")
+    detail_url = make_detail_url(item)
 
     if len(content) > 250:
         content = content[:250] + "..."
 
     return f"""🛗 K-apt 승강기 공고 알림
 
-공고명: {title}
-단지명: {apt_name}
-지역코드: {area}
+📍 지역: {area}
+🏢 단지: {apt_name}
+📌 공고명: {title}
+📄 공고번호: {bid_no}
+📅 공고일: {bid_date}
+⏰ 마감일: {deadline}
 상태: {status}
-공고번호: {bid_no}
-공고일: {bid_date}
-마감일: {deadline}
 
 내용:
 {content}
 
-상세 확인:
-https://www.k-apt.go.kr/
+🔗 상세보기:
+{detail_url}
 """
 
 
