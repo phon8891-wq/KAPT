@@ -14,7 +14,7 @@ SENT_FILE = "sent_notice.json"
 AREAS = ["부산", "양산", "김해"]
 KEYWORDS = ["승강기", "엘리베이터", "elevator", "리프트", "승강"]
 
-NUM_OF_ROWS = 100
+NUM_OF_ROWS = 500
 
 
 def load_sent():
