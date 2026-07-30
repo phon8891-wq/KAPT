@@ -4,9 +4,12 @@
 """
 K-APT 부산·경남 승강기 입찰공고 텔레그램 알림 봇
 
-- 최근 3일간의 K-APT 입찰공고 조회
-- 부산(26), 경남(48)의 승강기 관련 신규 공고 알림
-- 이미 알린 공고는 seen.json에 기록하여 중복 발송 방지
+수정 사항
+- 한 번의 API 조회에서 같은 공고가 여러 번 나와도 1회만 발송
+- 이미 발송한 공고는 seen.json에 기록
+- Render Persistent Disk가 /var/data에 있으면 해당 위치에 기록
+- 신규 공고가 없을 때 텔레그램 메시지를 보내지 않음
+- seen.json을 안전하게 임시 파일에 저장한 후 교체
 """
 
 import os
@@ -33,13 +36,9 @@ API_URL = (
     "ApHusBidPblAncInfoOfferServiceV2/getPblAncDeSearchV2"
 )
 
-# 부산 26, 경남 48
 TARGET_AREAS = {26, 48}
-
-# 승강기 유지관리 분류코드
 ELEVATOR_TYPE3 = {"06"}
 
-# 공고명에 포함될 승강기 관련 키워드
 ELEVATOR_KEYWORDS = [
     "승강기",
     "엘리베이터",
@@ -49,14 +48,21 @@ ELEVATOR_KEYWORDS = [
     "elev",
 ]
 
-# 최근 며칠간의 공고를 조회할지 설정
 LOOKBACK_DAYS = 3
-
-# 한 페이지당 조회 공고 수
 NUM_OF_ROWS = 100
 
-# 중복 알림 방지 기록 파일
-SEEN_FILE = "seen.json"
+
+# Render에 /var/data Persistent Disk가 연결되어 있으면 그곳에 저장한다.
+# 연결되어 있지 않으면 현재 폴더에 저장한다.
+PERSISTENT_DIR = "/var/data"
+
+if os.path.isdir(PERSISTENT_DIR) and os.access(PERSISTENT_DIR, os.W_OK):
+    SEEN_FILE = os.path.join(PERSISTENT_DIR, "seen.json")
+else:
+    SEEN_FILE = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "seen.json",
+    )
 
 
 # ───────────────────── 지역 및 상태 이름 ─────────────────────
@@ -98,13 +104,11 @@ STATE_NAME = {
 # ───────────────────── 기본 함수 ─────────────────────
 
 def log(message):
-    """실행 로그를 출력한다."""
     now = datetime.datetime.now().strftime("%H:%M:%S")
     print(f"[{now}] {message}", flush=True)
 
 
 def load_seen():
-    """이미 알림을 보낸 공고번호를 불러온다."""
     if not os.path.exists(SEEN_FILE):
         return set()
 
@@ -113,7 +117,11 @@ def load_seen():
             data = json.load(file)
 
         if isinstance(data, list):
-            return set(str(value) for value in data)
+            return {
+                str(value).strip()
+                for value in data
+                if str(value).strip()
+            }
 
         return set()
 
@@ -123,13 +131,28 @@ def load_seen():
 
 
 def save_seen(seen):
-    """알림을 보낸 공고번호를 저장한다."""
     try:
-        # 공고번호를 정렬한 후 최대 3000건까지만 저장
-        data = sorted(str(value) for value in seen)[-3000:]
+        directory = os.path.dirname(SEEN_FILE)
 
-        with open(SEEN_FILE, "w", encoding="utf-8") as file:
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+
+        data = sorted(
+            {
+                str(value).strip()
+                for value in seen
+                if str(value).strip()
+            }
+        )[-3000:]
+
+        temp_file = SEEN_FILE + ".tmp"
+
+        with open(temp_file, "w", encoding="utf-8") as file:
             json.dump(data, file, ensure_ascii=False, indent=2)
+            file.flush()
+            os.fsync(file.fileno())
+
+        os.replace(temp_file, SEEN_FILE)
 
     except Exception as error:
         log(f"알림 기록 저장 실패: {error}")
@@ -138,8 +161,6 @@ def save_seen(seen):
 # ───────────────────── K-APT API 조회 ─────────────────────
 
 def fetch_page(start_date, end_date, page_no, num_rows=NUM_OF_ROWS):
-    """K-APT API에서 지정한 페이지의 공고를 조회한다."""
-
     params = {
         "startDate": start_date,
         "endDate": end_date,
@@ -148,8 +169,6 @@ def fetch_page(start_date, end_date, page_no, num_rows=NUM_OF_ROWS):
         "type": "json",
     }
 
-    # 공공데이터포털 인증키는 이미 인코딩된 값일 수 있으므로
-    # serviceKey는 별도로 연결한다.
     query_string = (
         "serviceKey="
         + SERVICE_KEY
@@ -162,7 +181,7 @@ def fetch_page(start_date, end_date, page_no, num_rows=NUM_OF_ROWS):
     request = urllib.request.Request(
         url,
         headers={
-            "User-Agent": "kapt-elevator-bot/1.0",
+            "User-Agent": "kapt-elevator-bot/1.1",
             "Accept": "application/json",
         },
     )
@@ -174,8 +193,6 @@ def fetch_page(start_date, end_date, page_no, num_rows=NUM_OF_ROWS):
 
 
 def normalize_page_items(items):
-    """API 응답의 공고 목록 형태를 리스트로 통일한다."""
-
     if not items:
         return []
 
@@ -200,8 +217,6 @@ def normalize_page_items(items):
 
 
 def fetch_all(start_date, end_date):
-    """조회 기간 내 전체 공고를 페이지별로 모두 가져온다."""
-
     all_items = []
     page_no = 1
 
@@ -238,7 +253,8 @@ def fetch_all(start_date, end_date):
 
         log(
             f"페이지 {page_no}: "
-            f"{len(page_items)}건 / 누적 {len(all_items)}건 / 전체 {total_count}건"
+            f"{len(page_items)}건 / 누적 {len(all_items)}건 / "
+            f"전체 {total_count}건"
         )
 
         if total_count and len(all_items) >= total_count:
@@ -256,7 +272,6 @@ def fetch_all(start_date, end_date):
 # ───────────────────── 공고 필터 ─────────────────────
 
 def get_area_code(item):
-    """공고의 지역코드를 숫자로 반환한다."""
     try:
         return int(item.get("bidArea"))
     except (TypeError, ValueError):
@@ -264,14 +279,10 @@ def get_area_code(item):
 
 
 def is_target_area(item):
-    """부산 또는 경남 공고인지 확인한다."""
-    area_code = get_area_code(item)
-    return area_code in TARGET_AREAS
+    return get_area_code(item) in TARGET_AREAS
 
 
 def is_elevator(item):
-    """승강기 관련 공고인지 확인한다."""
-
     classify_type3 = str(
         item.get("codeClassifyType3") or ""
     ).strip()
@@ -279,21 +290,20 @@ def is_elevator(item):
     if classify_type3 in ELEVATOR_TYPE3:
         return True
 
-    title = str(item.get("bidTitle") or "")
+    title = str(item.get("bidTitle") or "").lower()
 
     return any(
-        keyword.lower() in title.lower()
+        keyword.lower() in title
         for keyword in ELEVATOR_KEYWORDS
     )
 
 
 def get_notice_id(item):
-    """공고의 고유번호를 반환한다."""
     for key in ["bidNum", "bidNo", "pblancNo"]:
         value = item.get(key)
 
-        if value:
-            return str(value)
+        if value is not None and str(value).strip():
+            return str(value).strip()
 
     return ""
 
@@ -301,7 +311,6 @@ def get_notice_id(item):
 # ───────────────────── 텔레그램 메시지 ─────────────────────
 
 def get_area_name(item):
-    """공고 지역 이름을 반환한다."""
     area_code = get_area_code(item)
 
     if area_code is None:
@@ -311,9 +320,7 @@ def get_area_name(item):
 
 
 def build_detail_url(item):
-    """K-APT 공고 상세보기 주소를 만든다."""
     bid_num = get_notice_id(item)
-
     encoded_bid_num = urllib.parse.quote(bid_num)
 
     return (
@@ -323,8 +330,6 @@ def build_detail_url(item):
 
 
 def build_message(item):
-    """텔레그램으로 보낼 공고 메시지를 만든다."""
-
     area_name = get_area_name(item)
 
     state_code = str(item.get("bidState") or "")
@@ -359,7 +364,10 @@ def build_message(item):
         else ""
     )
 
-    detail_url = build_detail_url(item)
+    detail_url = html.escape(
+        build_detail_url(item),
+        quote=True,
+    )
 
     lines = [
         "🛗 <b>K-APT 승강기 공고 알림</b>",
@@ -379,8 +387,6 @@ def build_message(item):
 
 
 def send_telegram(text):
-    """텔레그램 메시지를 발송한다."""
-
     url = (
         f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     )
@@ -398,7 +404,7 @@ def send_telegram(text):
         url,
         data=payload,
         headers={
-            "User-Agent": "kapt-elevator-bot/1.0",
+            "User-Agent": "kapt-elevator-bot/1.1",
         },
     )
 
@@ -421,6 +427,7 @@ def main():
     log("===================================")
     log("K-APT 부산·경남 승강기 공고 알림 시작")
     log("===================================")
+    log(f"중복 기록 파일: {SEEN_FILE}")
 
     missing_variables = []
 
@@ -467,6 +474,11 @@ def main():
 
     matched_items = []
 
+    # 이번 실행에서 이미 목록에 넣은 공고번호
+    current_run_ids = set()
+
+    duplicate_count = 0
+
     for item in all_items:
         if not is_target_area(item):
             continue
@@ -483,9 +495,16 @@ def main():
             )
             continue
 
+        # 과거 실행에서 이미 보낸 공고
         if notice_id in seen:
             continue
 
+        # 이번 API 조회 결과 안에서 중복으로 나온 공고
+        if notice_id in current_run_ids:
+            duplicate_count += 1
+            continue
+
+        current_run_ids.add(notice_id)
         matched_items.append(item)
 
     matched_items.sort(
@@ -495,6 +514,7 @@ def main():
         )
     )
 
+    log(f"조회 결과 내부 중복 제외: {duplicate_count}건")
     log(
         "조건 일치 "
         f"(부산·경남 + 승강기 + 미발송): "
@@ -503,20 +523,7 @@ def main():
 
     if not matched_items:
         log("새로운 승강기 공고가 없습니다.")
-
-        no_notice_message = (
-            "📭 <b>오늘 신규 공고 없음</b>\n"
-            f"📅 {today.strftime('%Y-%m-%d')}\n"
-            "부산·경남 승강기 관련 신규 입찰공고가 없습니다."
-        )
-
-        try:
-            send_telegram(no_notice_message)
-            log("'신규 공고 없음' 알림 발송 완료.")
-
-        except Exception as error:
-            log(f"'신규 공고 없음' 알림 발송 실패: {error}")
-
+        log("텔레그램 메시지는 발송하지 않습니다.")
         return
 
     sent_count = 0
@@ -524,6 +531,11 @@ def main():
     for item in matched_items:
         notice_id = get_notice_id(item)
         title = str(item.get("bidTitle") or "제목 없음")
+
+        # 발송 직전에도 다시 한번 중복 확인
+        if notice_id in seen:
+            log(f"중복 발송 직전 차단: {title}")
+            continue
 
         try:
             message = build_message(item)
@@ -533,12 +545,18 @@ def main():
             save_seen(seen)
 
             sent_count += 1
-            log(f"텔레그램 발송 완료: {title}")
+            log(
+                f"텔레그램 발송 완료: "
+                f"{title} / {notice_id}"
+            )
 
             time.sleep(0.5)
 
         except Exception as error:
-            log(f"텔레그램 발송 실패: {title} / {error}")
+            log(
+                f"텔레그램 발송 실패: "
+                f"{title} / {error}"
+            )
 
     log("===================================")
     log(f"신규 공고 발송: {sent_count}건")
