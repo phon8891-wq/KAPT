@@ -8,6 +8,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: kapt-alert
+  cancel-in-progress: false
+
 jobs:
   run-kapt-alert:
     runs-on: ubuntu-latest
@@ -15,6 +19,8 @@ jobs:
     steps:
       - name: 저장소 가져오기
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Python 설정
         uses: actions/setup-python@v5
@@ -28,17 +34,18 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python main.py
 
-      - name: seen.json 저장
+      - name: sent_notice.json 저장
         run: |
-          if [ -f seen.json ]; then
+          if [ -f sent_notice.json ]; then
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add seen.json
+
+            git add sent_notice.json
 
             if git diff --cached --quiet; then
-              echo "seen.json 변경 없음"
+              echo "sent_notice.json 변경 없음"
             else
-              git commit -m "Update KAPT seen records"
+              git commit -m "Update sent notice list"
               git push
             fi
           fi
