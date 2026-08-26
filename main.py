@@ -3,12 +3,14 @@
 
 """
 K-APT 부산·경남 승강기 입찰공고 텔레그램 알림 봇
-GitHub Actions 전용
+GitHub Actions 전용 - K-APT 웹페이지 직접 조회 버전
 
-- 한 번 실행 후 종료
-- sent_notice.json으로 중복 알림 방지
-- 부산(26), 경남(48) 승강기 관련 공고만 알림
-- API 오류 발생 시 응답 내용까지 로그 출력
+- 공공데이터포털 API 사용 안 함
+- K-APT 전국 입찰공고 페이지 직접 조회
+- 부산 / 경남 공고만 필터링
+- 승강기 관련 공고만 필터링
+- sent_notice.json 중복 방지
+- API -> WEB 방식 첫 전환 시 기존 공고는 발송하지 않음
 """
 
 import os
@@ -16,62 +18,67 @@ import sys
 import json
 import time
 import datetime
+import hashlib
+import html
+import re
 import urllib.request
 import urllib.parse
 import urllib.error
-import html
+
+from html.parser import HTMLParser
 
 
 # =========================================================
 # 환경변수
 # =========================================================
 
-SERVICE_KEY = os.environ.get("KAPT_SERVICE_KEY", "").strip()
-TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-TG_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+TG_TOKEN = os.environ.get(
+    "TELEGRAM_BOT_TOKEN",
+    ""
+).strip()
+
+TG_CHAT_ID = os.environ.get(
+    "TELEGRAM_CHAT_ID",
+    ""
+).strip()
 
 
 # =========================================================
-# K-APT API
+# K-APT 웹 주소
 # =========================================================
 
-API_URL = (
-    "https://apis.data.go.kr/1613000/"
-    "ApHusBidPblAncInfoOfferServiceV2/"
-    "getPblAncDeSearchV2"
+KAPT_BASE = "https://www.k-apt.go.kr"
+
+KAPT_LIST_URL = (
+    "https://www.k-apt.go.kr/bid/bidList.do"
 )
+
+# 한 번 실행할 때 확인할 페이지 수
+# GitHub Actions가 주기적으로 실행되므로 10페이지면 충분히 넉넉함
+MAX_PAGES = 10
+
+MAX_RETRIES = 3
+
+MAX_SENT_ITEMS = 5000
 
 
 # =========================================================
 # 검색 조건
 # =========================================================
 
-# 부산 26 / 경남 48
-TARGET_AREAS = {26, 48}
+TARGET_REGIONS = {
+    "부산",
+    "경남",
+}
 
-# 승강기 업종 코드
-ELEVATOR_TYPE3 = {"06"}
-
-# 혹시 코드가 누락된 공고를 잡기 위한 제목 키워드
 ELEVATOR_KEYWORDS = [
     "승강기",
     "엘리베이터",
     "엘레베이터",
     "리프트",
+    "elevator",
     "elev",
 ]
-
-# 최근 며칠 공고 조회
-LOOKBACK_DAYS = 3
-
-# API 한 페이지 조회 건수
-NUM_OF_ROWS = 100
-
-# API 및 텔레그램 재시도 횟수
-MAX_RETRIES = 3
-
-# sent_notice.json 최대 보관 개수
-MAX_SENT_ITEMS = 5000
 
 
 # =========================================================
@@ -79,52 +86,11 @@ MAX_SENT_ITEMS = 5000
 # =========================================================
 
 SENT_FILE = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
+    os.path.dirname(
+        os.path.abspath(__file__)
+    ),
     "sent_notice.json",
 )
-
-
-# =========================================================
-# 지역명
-# =========================================================
-
-AREA_NAME = {
-    11: "서울",
-    26: "부산",
-    27: "대구",
-    28: "인천",
-    29: "광주",
-    30: "대전",
-    31: "울산",
-    36: "세종",
-    41: "경기",
-    42: "강원",
-    43: "충북",
-    44: "충남",
-    45: "전북",
-    46: "전남",
-    47: "경북",
-    48: "경남",
-    50: "제주",
-}
-
-
-# =========================================================
-# 공고 상태
-# =========================================================
-
-STATE_NAME = {
-    "1": "신규공고",
-    "2": "수정공고",
-    "3": "재공고",
-    "4": "유찰",
-    "5": "낙찰(계약완료)",
-    "6": "취소",
-    "8": "낙찰(계약진행)",
-    "9": "낙찰무효",
-    "10": "계약취소",
-    "99": "낙찰취소 후 신규공고",
-}
 
 
 # =========================================================
@@ -132,7 +98,9 @@ STATE_NAME = {
 # =========================================================
 
 def log(message):
-    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now = datetime.datetime.now().strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
 
     print(
         f"[{now}] {message}",
@@ -141,14 +109,16 @@ def log(message):
 
 
 # =========================================================
-# 발송 기록 불러오기
+# 발송 기록
 # =========================================================
 
 def load_sent():
+
     if not os.path.exists(SENT_FILE):
         return set(), False
 
     try:
+
         with open(
             SENT_FILE,
             "r",
@@ -169,18 +139,16 @@ def load_sent():
         return sent, True
 
     except Exception as error:
+
         log(
-            f"sent_notice.json 불러오기 실패: {error}"
+            f"sent_notice.json 읽기 실패: {error}"
         )
 
         return set(), False
 
 
-# =========================================================
-# 발송 기록 저장
-# =========================================================
-
 def save_sent(sent):
+
     values = sorted({
         str(value).strip()
         for value in sent
@@ -215,35 +183,159 @@ def save_sent(sent):
 
 
 # =========================================================
-# API 한 페이지 조회
+# HTML 테이블 파서
 # =========================================================
 
-def fetch_page(start_date, end_date, page_no):
+class BidTableParser(HTMLParser):
+
+    def __init__(self):
+
+        super().__init__(
+            convert_charrefs=True
+        )
+
+        self.in_tr = False
+        self.in_td = False
+
+        self.current_row = []
+        self.current_cell = []
+
+        self.current_href = ""
+        self.current_onclick = ""
+
+        self.rows = []
+
+    def handle_starttag(
+        self,
+        tag,
+        attrs,
+    ):
+
+        tag = tag.lower()
+
+        attrs_dict = dict(attrs)
+
+        if tag == "tr":
+
+            self.in_tr = True
+            self.current_row = []
+
+        elif (
+            tag == "td"
+            and self.in_tr
+        ):
+
+            self.in_td = True
+            self.current_cell = []
+
+        elif (
+            tag == "a"
+            and self.in_tr
+            and self.in_td
+        ):
+
+            href = attrs_dict.get(
+                "href",
+                "",
+            )
+
+            onclick = attrs_dict.get(
+                "onclick",
+                "",
+            )
+
+            if (
+                href
+                and href != "#"
+                and not href.lower().startswith(
+                    "javascript:"
+                )
+            ):
+
+                self.current_href = href
+
+            if onclick:
+                self.current_onclick = onclick
+
+    def handle_data(
+        self,
+        data,
+    ):
+
+        if (
+            self.in_tr
+            and self.in_td
+        ):
+
+            text = data.strip()
+
+            if text:
+                self.current_cell.append(
+                    text
+                )
+
+    def handle_endtag(
+        self,
+        tag,
+    ):
+
+        tag = tag.lower()
+
+        if (
+            tag == "td"
+            and self.in_td
+        ):
+
+            text = " ".join(
+                self.current_cell
+            ).strip()
+
+            self.current_row.append(
+                text
+            )
+
+            self.current_cell = []
+
+            self.in_td = False
+
+        elif (
+            tag == "tr"
+            and self.in_tr
+        ):
+
+            if self.current_row:
+
+                self.rows.append({
+                    "cells": self.current_row[:],
+                    "href": self.current_href,
+                    "onclick": self.current_onclick,
+                })
+
+            self.current_row = []
+
+            self.current_href = ""
+            self.current_onclick = ""
+
+            self.in_tr = False
+            self.in_td = False
+
+
+# =========================================================
+# K-APT 페이지 다운로드
+# =========================================================
+
+def fetch_html(page_no):
 
     params = {
-        "serviceKey": SERVICE_KEY,
-        "startDate": start_date,
-        "endDate": end_date,
         "pageNo": page_no,
-        "numOfRows": NUM_OF_ROWS,
-        "type": "json",
+        "type": 4,
+        "searchBidGb": "bid_gb_1",
     }
 
-    # serviceKey에 이미 % 인코딩이 들어있는 경우
-    # 다시 %25로 변환되는 문제를 막기 위해 safe="%" 사용
-    query_string = urllib.parse.urlencode(
-        params,
-        safe="%",
-    )
-
-    url = API_URL + "?" + query_string
-
-    request = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": "Mozilla/5.0",
-            "Accept": "application/json",
-        },
+    url = (
+        KAPT_LIST_URL
+        + "?"
+        + urllib.parse.urlencode(params)
     )
 
     last_error = None
@@ -254,409 +346,383 @@ def fetch_page(start_date, end_date, page_no):
     ):
 
         try:
+
             log(
-                f"API 요청: page={page_no}, "
-                f"{start_date} ~ {end_date}"
+                f"K-APT 웹 조회 "
+                f"page={page_no} "
+                f"({attempt}/{MAX_RETRIES})"
+            )
+
+            request = urllib.request.Request(
+                url,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 "
+                        "(Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) "
+                        "Chrome/124.0 Safari/537.36"
+                    ),
+                    "Accept": (
+                        "text/html,"
+                        "application/xhtml+xml,"
+                        "application/xml;q=0.9,*/*;q=0.8"
+                    ),
+                    "Accept-Language": (
+                        "ko-KR,ko;q=0.9,en;q=0.8"
+                    ),
+                    "Referer": (
+                        "https://www.k-apt.go.kr/"
+                    ),
+                    "Connection": "close",
+                },
             )
 
             with urllib.request.urlopen(
                 request,
-                timeout=30,
+                timeout=20,
             ) as response:
 
-                raw_data = response.read().decode(
-                    "utf-8",
-                    errors="replace",
+                raw = response.read()
+
+                charset = (
+                    response.headers.get_content_charset()
+                    or "utf-8"
                 )
 
-            # 응답이 JSON인지 확인
             try:
-                return json.loads(raw_data)
 
-            except json.JSONDecodeError:
-                raise RuntimeError(
-                    "API 응답이 JSON이 아닙니다. "
-                    f"응답 일부: {raw_data[:500]}"
-                )
-
-        except urllib.error.HTTPError as error:
-
-            try:
-                error_body = error.read().decode(
-                    "utf-8",
+                text = raw.decode(
+                    charset,
                     errors="replace",
                 )
 
             except Exception:
-                error_body = ""
 
-            last_error = (
-                f"HTTP {error.code} "
-                f"{error.reason}"
-            )
-
-            if error_body:
-                last_error += (
-                    f" / 서버 응답: "
-                    f"{error_body[:1000]}"
+                text = raw.decode(
+                    "utf-8",
+                    errors="replace",
                 )
 
-            log(
-                f"API 요청 실패 "
-                f"({attempt}/{MAX_RETRIES}): "
-                f"{last_error}"
-            )
+            if (
+                "입찰목록"
+                not in text
+                and "전국 입찰공고"
+                not in text
+            ):
 
-        except urllib.error.URLError as error:
+                raise RuntimeError(
+                    "K-APT 입찰공고 페이지가 아닌 "
+                    "다른 응답을 받았습니다."
+                )
 
-            last_error = (
-                f"URL 오류: {error}"
-            )
-
-            log(
-                f"API 요청 실패 "
-                f"({attempt}/{MAX_RETRIES}): "
-                f"{last_error}"
-            )
+            return text
 
         except Exception as error:
 
-            last_error = str(error)
+            last_error = error
 
             log(
-                f"API 요청 실패 "
-                f"({attempt}/{MAX_RETRIES}): "
-                f"{last_error}"
+                f"K-APT 웹 조회 실패: {error}"
             )
 
-        if attempt < MAX_RETRIES:
+            if attempt < MAX_RETRIES:
 
-            time.sleep(
-                attempt * 3
-            )
+                time.sleep(
+                    attempt * 3
+                )
 
     raise RuntimeError(
-        "K-APT API 요청 최종 실패: "
+        "K-APT 웹 조회 최종 실패: "
         f"{last_error}"
     )
 
 
 # =========================================================
-# API items 형태 정리
+# 지역 추출
 # =========================================================
 
-def normalize_page_items(items):
+def extract_region(title):
 
-    if not items:
-        return []
-
-    if isinstance(
-        items,
-        list,
-    ):
-        return items
-
-    if isinstance(
-        items,
-        dict,
-    ):
-
-        if "item" in items:
-
-            item_data = items["item"]
-
-            if isinstance(
-                item_data,
-                list,
-            ):
-                return item_data
-
-            if isinstance(
-                item_data,
-                dict,
-            ):
-                return [item_data]
-
-            return []
-
-        return [items]
-
-    return []
-
-
-# =========================================================
-# 전체 페이지 조회
-# =========================================================
-
-def fetch_all(start_date, end_date):
-
-    all_items = []
-
-    page_no = 1
-
-    while True:
-
-        data = fetch_page(
-            start_date,
-            end_date,
-            page_no,
-        )
-
-        response = data.get(
-            "response",
-            {},
-        )
-
-        header = response.get(
-            "header",
-            {},
-        )
-
-        body = response.get(
-            "body",
-            {},
-        )
-
-        result_code = str(
-            header.get(
-                "resultCode",
-                "",
-            )
-        ).strip()
-
-        if (
-            result_code
-            and result_code not in {"00", "0"}
-        ):
-
-            result_message = header.get(
-                "resultMsg",
-                "알 수 없는 오류",
-            )
-
-            raise RuntimeError(
-                "K-APT API 오류: "
-                f"{result_code} / "
-                f"{result_message}"
-            )
-
-        try:
-
-            total_count = int(
-                body.get(
-                    "totalCount",
-                    0,
-                )
-                or 0
-            )
-
-        except (
-            TypeError,
-            ValueError,
-        ):
-
-            total_count = 0
-
-        page_items = normalize_page_items(
-            body.get(
-                "items",
-                [],
-            )
-        )
-
-        if not page_items:
-            break
-
-        all_items.extend(
-            page_items
-        )
-
-        log(
-            f"페이지 {page_no}: "
-            f"{len(page_items)}건 / "
-            f"누적 {len(all_items)}건 / "
-            f"전체 {total_count}건"
-        )
-
-        if (
-            total_count
-            and len(all_items) >= total_count
-        ):
-            break
-
-        if len(page_items) < NUM_OF_ROWS:
-            break
-
-        page_no += 1
-
-        time.sleep(0.3)
-
-    return all_items
-
-
-# =========================================================
-# 지역 코드
-# =========================================================
-
-def get_area_code(item):
-
-    try:
-
-        return int(
-            item.get(
-                "bidArea"
-            )
-        )
-
-    except (
-        TypeError,
-        ValueError,
-    ):
-
-        return None
-
-
-# =========================================================
-# 부산·경남 여부
-# =========================================================
-
-def is_target_area(item):
-
-    return (
-        get_area_code(item)
-        in TARGET_AREAS
+    match = re.search(
+        r"\[([^\]]+)\]",
+        title,
     )
+
+    if not match:
+        return ""
+
+    return match.group(1).strip()
 
 
 # =========================================================
 # 승강기 공고 여부
 # =========================================================
 
-def is_elevator(item):
+def is_elevator(title):
 
-    classify_type3 = str(
-        item.get(
-            "codeClassifyType3"
-        )
-        or ""
-    ).strip()
-
-    if (
-        classify_type3
-        in ELEVATOR_TYPE3
-    ):
-        return True
-
-    title = str(
-        item.get(
-            "bidTitle"
-        )
-        or ""
-    ).lower()
+    text = title.lower()
 
     return any(
-        keyword.lower()
-        in title
-        for keyword
-        in ELEVATOR_KEYWORDS
+        keyword.lower() in text
+        for keyword in ELEVATOR_KEYWORDS
     )
 
 
 # =========================================================
-# 공고번호
+# 부산 / 경남 여부
 # =========================================================
 
-def get_notice_id(item):
+def is_target_region(title):
 
-    for key in [
-        "bidNum",
-        "bidNo",
-        "pblancNo",
-    ]:
+    region = extract_region(
+        title
+    )
 
-        value = item.get(
-            key
+    return (
+        region
+        in TARGET_REGIONS
+    )
+
+
+# =========================================================
+# 상세 링크 만들기
+# =========================================================
+
+def make_detail_url(
+    href,
+    onclick,
+):
+
+    if href:
+
+        return urllib.parse.urljoin(
+            KAPT_BASE,
+            href,
         )
 
-        if (
-            value is not None
-            and str(value).strip()
-        ):
+    # onclick 안에서 bidNum 추출 시도
+    if onclick:
 
-            return str(
-                value
-            ).strip()
+        # 긴 숫자 형태의 입찰번호 추출
+        numbers = re.findall(
+            r"['\"]?(\d{6,})['\"]?",
+            onclick,
+        )
 
-    return ""
+        if numbers:
+
+            bid_num = numbers[-1]
+
+            return (
+                "https://www.k-apt.go.kr/"
+                "bid/bidDetail.do?bidNum="
+                + urllib.parse.quote(
+                    bid_num
+                )
+            )
+
+    return KAPT_LIST_URL
 
 
 # =========================================================
-# 중복 제거 + 조건 필터링
+# 안정적인 공고 ID 생성
 # =========================================================
 
-def unique_target_items(all_items):
+def make_notice_id(
+    title,
+    deadline,
+    apartment,
+    registration_date,
+):
 
-    unique_items = {}
+    source = "|".join([
+        title.strip(),
+        deadline.strip(),
+        apartment.strip(),
+        registration_date.strip(),
+    ])
 
-    for item in all_items:
+    digest = hashlib.sha256(
+        source.encode("utf-8")
+    ).hexdigest()[:24]
 
-        if not is_target_area(
-            item
+    return (
+        "WEB-"
+        + digest
+    )
+
+
+# =========================================================
+# HTML 한 페이지에서 공고 추출
+# =========================================================
+
+def parse_bids(html_text):
+
+    parser = BidTableParser()
+
+    parser.feed(
+        html_text
+    )
+
+    results = []
+
+    for row in parser.rows:
+
+        cells = row.get(
+            "cells",
+            [],
+        )
+
+        # 정상적인 K-APT 입찰 목록은 보통
+        # 순번 / 종류 / 낙찰방법 / 공고명 /
+        # 마감일 / 상태 / 단지명 / 공고일
+        if len(cells) < 8:
+            continue
+
+        try:
+
+            number = cells[0]
+            bid_type = cells[1]
+            award_method = cells[2]
+            title = cells[3]
+            deadline = cells[4]
+            state = cells[5]
+            apartment = cells[6]
+            registration_date = cells[7]
+
+        except IndexError:
+            continue
+
+        # 실제 입찰 데이터가 아닌 행 제거
+        if not title:
+            continue
+
+        if title == "입찰공고명":
+            continue
+
+        if "입찰 정보가 존재" in title:
+            continue
+
+        notice_id = make_notice_id(
+            title,
+            deadline,
+            apartment,
+            registration_date,
+        )
+
+        detail_url = make_detail_url(
+            row.get(
+                "href",
+                "",
+            ),
+            row.get(
+                "onclick",
+                "",
+            ),
+        )
+
+        results.append({
+            "id": notice_id,
+            "number": number,
+            "bid_type": bid_type,
+            "award_method": award_method,
+            "title": title,
+            "deadline": deadline,
+            "state": state,
+            "apartment": apartment,
+            "registration_date": registration_date,
+            "region": extract_region(
+                title
+            ),
+            "url": detail_url,
+        })
+
+    return results
+
+
+# =========================================================
+# 최신 공고 전체 조회
+# =========================================================
+
+def fetch_recent_bids():
+
+    all_items = {}
+
+    empty_pages = 0
+
+    for page_no in range(
+        1,
+        MAX_PAGES + 1,
+    ):
+
+        html_text = fetch_html(
+            page_no
+        )
+
+        items = parse_bids(
+            html_text
+        )
+
+        log(
+            f"페이지 {page_no}: "
+            f"{len(items)}건 파싱"
+        )
+
+        if not items:
+
+            empty_pages += 1
+
+            if empty_pages >= 2:
+                break
+
+        else:
+
+            empty_pages = 0
+
+        for item in items:
+
+            all_items[
+                item["id"]
+            ] = item
+
+        time.sleep(0.5)
+
+    return list(
+        all_items.values()
+    )
+
+
+# =========================================================
+# 대상 공고 필터
+# =========================================================
+
+def filter_target_bids(items):
+
+    results = []
+
+    for item in items:
+
+        title = item.get(
+            "title",
+            "",
+        )
+
+        if not is_target_region(
+            title
         ):
             continue
 
         if not is_elevator(
-            item
+            title
         ):
             continue
 
-        notice_id = get_notice_id(
+        results.append(
             item
         )
 
-        if notice_id:
-
-            unique_items[
-                notice_id
-            ] = item
-
-    return list(
-        unique_items.values()
-    )
-
-
-# =========================================================
-# 지역명 표시
-# =========================================================
-
-def get_area_name(item):
-
-    area_code = get_area_code(
-        item
-    )
-
-    if area_code is None:
-        return "지역 미확인"
-
-    return AREA_NAME.get(
-        area_code,
-        str(area_code),
-    )
-
-
-# =========================================================
-# K-APT 상세페이지
-# =========================================================
-
-def build_detail_url(item):
-
-    return (
-        "https://www.k-apt.go.kr/"
-        "bid/bidDetail.do?bidNum="
-        + urllib.parse.quote(
-            get_notice_id(item)
-        )
-    )
+    return results
 
 
 # =========================================================
@@ -665,91 +731,76 @@ def build_detail_url(item):
 
 def build_message(item):
 
-    state_code = str(
+    region = html.escape(
         item.get(
-            "bidState"
+            "region",
+            "지역 미확인",
         )
-        or ""
-    ).strip()
+    )
 
-    state_name = STATE_NAME.get(
-        state_code,
-        (
-            state_code
-            if state_code
-            else "상태 미확인"
-        ),
+    apartment = html.escape(
+        item.get(
+            "apartment",
+            "단지명 미확인",
+        )
     )
 
     title = html.escape(
-        str(
-            item.get(
-                "bidTitle"
-            )
-            or "제목 없음"
-        )
-    )
-
-    apartment_name = html.escape(
-        str(
-            item.get(
-                "bidKaptname"
-            )
-            or "단지명 없음"
-        )
-    )
-
-    registration_date = html.escape(
-        str(
-            item.get(
-                "bidRegDate"
-            )
-            or "미확인"
+        item.get(
+            "title",
+            "제목 없음",
         )
     )
 
     deadline = html.escape(
-        str(
-            item.get(
-                "bidDeadline"
-            )
-            or "미확인"
+        item.get(
+            "deadline",
+            "미확인",
         )
     )
 
-    bid_num = html.escape(
-        get_notice_id(item)
-        or "번호 없음"
+    state = html.escape(
+        item.get(
+            "state",
+            "미확인",
+        )
     )
 
-    emergency = (
-        " ⚠️ 긴급공고"
-        if str(
-            item.get(
-                "bidEmrgYn"
-            )
-            or ""
-        ).upper() == "Y"
-        else ""
+    registration_date = html.escape(
+        item.get(
+            "registration_date",
+            "미확인",
+        )
+    )
+
+    award_method = html.escape(
+        item.get(
+            "award_method",
+            "미확인",
+        )
     )
 
     detail_url = html.escape(
-        build_detail_url(item),
+        item.get(
+            "url",
+            KAPT_LIST_URL,
+        ),
         quote=True,
     )
 
     return "\n".join([
         "🛗 <b>K-APT 승강기 공고 알림</b>",
         "",
-        f"📍 지역: <b>{get_area_name(item)}</b>",
-        f"🏢 단지: {apartment_name}",
-        f"📌 공고명: {title}{emergency}",
-        f"📄 공고번호: {bid_num}",
-        f"📋 상태: {html.escape(state_name)}",
+        f"📍 지역: <b>{region}</b>",
+        f"🏢 단지: {apartment}",
+        f"📌 공고명: {title}",
+        f"📋 상태: {state}",
+        f"💰 낙찰방법: {award_method}",
         f"📅 공고일: {registration_date}",
-        f"⏰ 마감일: {deadline}",
+        f"⏰ 마감일: <b>{deadline}</b>",
         "",
-        f'<a href="{detail_url}">🔗 K-APT 상세보기</a>',
+        f'🔗 <a href="{detail_url}">'
+        f'K-APT 확인하기</a>',
     ])
 
 
@@ -777,7 +828,9 @@ def send_telegram(text):
         url,
         data=payload,
         headers={
-            "User-Agent": "kapt-elevator-bot/5.0",
+            "User-Agent": (
+                "kapt-elevator-bot-web/1.0"
+            ),
         },
     )
 
@@ -795,19 +848,21 @@ def send_telegram(text):
                 timeout=30,
             ) as response:
 
-                result = json.loads(
-                    response.read().decode(
-                        "utf-8"
-                    )
+                raw = response.read().decode(
+                    "utf-8",
+                    errors="replace",
                 )
+
+            result = json.loads(
+                raw
+            )
 
             if not result.get(
                 "ok"
             ):
 
                 raise RuntimeError(
-                    "텔레그램 응답 오류: "
-                    f"{result}"
+                    f"텔레그램 응답 오류: {result}"
                 )
 
             return
@@ -842,17 +897,14 @@ def validate_environment():
 
     missing = []
 
-    if not SERVICE_KEY:
-        missing.append(
-            "KAPT_SERVICE_KEY"
-        )
-
     if not TG_TOKEN:
+
         missing.append(
             "TELEGRAM_BOT_TOKEN"
         )
 
     if not TG_CHAT_ID:
+
         missing.append(
             "TELEGRAM_CHAT_ID"
         )
@@ -877,108 +929,128 @@ def main():
 
     validate_environment()
 
-    today = datetime.date.today()
-
-    start_date = (
-        today
-        - datetime.timedelta(
-            days=LOOKBACK_DAYS
-        )
-    ).strftime(
-        "%Y-%m-%d"
-    )
-
-    end_date = today.strftime(
-        "%Y-%m-%d"
+    log(
+        "======================================"
     )
 
     log(
-        "K-APT 공고 조회 시작"
+        "K-APT WEB 방식 조회 시작"
     )
 
     log(
-        f"조회 기간: "
-        f"{start_date} ~ {end_date}"
+        "대상: 부산·경남 승강기 관련 공고"
+    )
+
+    log(
+        "======================================"
     )
 
     sent, sent_file_exists = load_sent()
 
-    all_items = fetch_all(
-        start_date,
-        end_date,
-    )
+    all_items = fetch_recent_bids()
 
-    target_items = unique_target_items(
+    target_items = filter_target_bids(
         all_items
     )
 
-    current_ids = {
-        get_notice_id(
-            item
-        )
-        for item
-        in target_items
-        if get_notice_id(
-            item
-        )
-    }
+    log(
+        f"최근 조회 전체 공고: "
+        f"{len(all_items)}건"
+    )
 
     log(
-        "부산·경남 승강기 공고: "
+        f"부산·경남 승강기 대상: "
         f"{len(target_items)}건"
     )
 
     log(
-        "기존 발송 기록: "
+        f"기존 발송 기록: "
         f"{len(sent)}건"
     )
 
-    # sent_notice.json이 없으면
-    # 현재 공고는 발송하지 않고 기준값만 저장
-    if not sent_file_exists:
+    current_web_ids = {
+        item["id"]
+        for item in target_items
+    }
+
+    # =====================================================
+    # API 방식 -> WEB 방식 최초 전환 확인
+    #
+    # 기존 sent_notice.json에는 숫자형 API 공고번호만 있고
+    # WEB- 형태 ID가 없다.
+    #
+    # 이 상태에서 바로 발송하면 기존 최근 공고가
+    # 전부 신규로 인식될 수 있기 때문에
+    # 첫 실행은 기준값만 저장한다.
+    # =====================================================
+
+    has_web_history = any(
+        str(value).startswith(
+            "WEB-"
+        )
+        for value in sent
+    )
+
+    if not has_web_history:
+
+        sent.update(
+            current_web_ids
+        )
 
         save_sent(
-            current_ids
+            sent
         )
 
         log(
-            "최초 실행: 기존 공고 "
-            f"{len(current_ids)}건을 "
-            "기준값으로 저장"
+            "WEB 방식 최초 실행"
         )
 
         log(
-            "기존 공고는 발송하지 않음"
+            f"현재 대상 공고 "
+            f"{len(current_web_ids)}건을 "
+            f"기준값으로 저장"
+        )
+
+        log(
+            "기존 공고 대량 발송 방지를 위해 "
+            "이번 실행에서는 알림을 보내지 않습니다."
+        )
+
+        log(
+            "다음 실행부터 신규 공고만 알림됩니다."
+        )
+
+        log(
+            "정상 종료"
         )
 
         return
 
+    # =====================================================
+    # 신규 공고 찾기
+    # =====================================================
+
     new_items = [
         item
-        for item
-        in target_items
-        if get_notice_id(
-            item
-        )
-        not in sent
+        for item in target_items
+        if item["id"] not in sent
     ]
 
     new_items.sort(
         key=lambda item: (
-            str(
-                item.get(
-                    "bidRegDate"
-                )
-                or ""
+            item.get(
+                "registration_date",
+                "",
             ),
-            get_notice_id(
-                item
+            item.get(
+                "title",
+                "",
             ),
         )
     )
 
     log(
-        "신규 미발송 공고: "
+        f"신규 미발송 공고: "
         f"{len(new_items)}건"
     )
 
@@ -986,19 +1058,14 @@ def main():
 
     for item in new_items:
 
-        notice_id = get_notice_id(
-            item
-        )
+        notice_id = item[
+            "id"
+        ]
 
-        title = str(
-            item.get(
-                "bidTitle"
-            )
-            or "제목 없음"
+        title = item.get(
+            "title",
+            "제목 없음",
         )
-
-        if notice_id in sent:
-            continue
 
         try:
 
@@ -1012,6 +1079,8 @@ def main():
                 notice_id
             )
 
+            # 한 건 발송할 때마다 바로 저장
+            # 중간 실패 시에도 중복 발송 방지
             save_sent(
                 sent
             )
@@ -1019,499 +1088,26 @@ def main():
             sent_count += 1
 
             log(
-                "발송 완료: "
-                f"{title} / "
-                f"{notice_id}"
+                f"발송 완료: {title}"
             )
 
             time.sleep(1)
 
         except Exception as error:
 
-            log(
-                "발송 실패: "
-                f"{title} / "
-                f"{error}"
-            )
-
-    log(
-        "이번 실행 발송: "
-        f"{sent_count}건"
-    )
-
-    log(
-        "실행 종료"
-    )
-
-
-if __name__ == "__main__":
-    main()MAX_SENT_ITEMS = 5000
-
-SENT_FILE = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "sent_notice.json",
-)
-
-AREA_NAME = {
-    11: "서울", 26: "부산", 27: "대구", 28: "인천", 29: "광주",
-    30: "대전", 31: "울산", 36: "세종", 41: "경기", 42: "강원",
-    43: "충북", 44: "충남", 45: "전북", 46: "전남", 47: "경북",
-    48: "경남", 50: "제주",
-}
-
-STATE_NAME = {
-    "1": "신규공고", "2": "수정공고", "3": "재공고", "4": "유찰",
-    "5": "낙찰(계약완료)", "6": "취소", "8": "낙찰(계약진행)",
-    "9": "낙찰무효", "10": "계약취소", "99": "낙찰취소 후 신규공고",
-}
-
-
-def log(message):
-    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{now}] {message}", flush=True)
-
-
-def load_sent():
-    if not os.path.exists(SENT_FILE):
-        return set(), False
-
-    try:
-        with open(SENT_FILE, "r", encoding="utf-8") as file:
-            data = json.load(file)
-
-        if not isinstance(data, list):
-            return set(), False
-
-        sent = {
-            str(value).strip()
-            for value in data
-            if str(value).strip()
-        }
-
-        return sent, True
-
-    except Exception as error:
-        log(f"sent_notice.json 불러오기 실패: {error}")
-        return set(), False
-
-
-def save_sent(sent):
-    values = sorted({
-        str(value).strip()
-        for value in sent
-        if str(value).strip()
-    })[-MAX_SENT_ITEMS:]
-
-    temp_file = SENT_FILE + ".tmp"
-
-    with open(temp_file, "w", encoding="utf-8") as file:
-        json.dump(values, file, ensure_ascii=False, indent=2)
-        file.flush()
-        os.fsync(file.fileno())
-
-    os.replace(temp_file, SENT_FILE)
-
-
-def fetch_page(start_date, end_date, page_no):
-    params = {
-        "startDate": start_date,
-        "endDate": end_date,
-        "pageNo": page_no,
-        "numOfRows": NUM_OF_ROWS,
-        "type": "json",
-    }
-
-    query_string = (
-        "serviceKey=" + SERVICE_KEY + "&" + urllib.parse.urlencode(params)
-    )
-
-    request = urllib.request.Request(
-        API_URL + "?" + query_string,
-        headers={
-            "User-Agent": "kapt-elevator-bot/4.0",
-            "Accept": "application/json",
-        },
-    )
-
-    last_error = None
-
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            with urllib.request.urlopen(request, timeout=30) as response:
-                raw_data = response.read().decode("utf-8")
-            return json.loads(raw_data)
-
-        except Exception as error:
-            last_error = error
-            log(f"API 요청 실패 ({attempt}/{MAX_RETRIES}): {error}")
-
-            if attempt < MAX_RETRIES:
-                time.sleep(attempt * 3)
-
-    raise RuntimeError(f"K-APT API 요청 최종 실패: {last_error}")
-
-
-def normalize_page_items(items):
-    if not items:
-        return []
-
-    if isinstance(items, list):
-        return items
-
-    if isinstance(items, dict):
-        if "item" in items:
-            item_data = items["item"]
-
-            if isinstance(item_data, list):
-                return item_data
-
-            if isinstance(item_data, dict):
-                return [item_data]
-
-            return []
-
-        return [items]
-
-    return []
-
-
-def fetch_all(start_date, end_date):
-    all_items = []
-    page_no = 1
-
-    while True:
-        data = fetch_page(start_date, end_date, page_no)
-
-        response = data.get("response", {})
-        header = response.get("header", {})
-        body = response.get("body", {})
-
-        result_code = str(header.get("resultCode", "")).strip()
-
-        if result_code and result_code not in {"00", "0"}:
-            result_message = header.get("resultMsg", "알 수 없는 오류")
-            raise RuntimeError(
-                f"K-APT API 오류: {result_code} / {result_message}"
-            )
-
-        try:
-            total_count = int(body.get("totalCount", 0) or 0)
-        except (TypeError, ValueError):
-            total_count = 0
-
-        page_items = normalize_page_items(body.get("items", []))
-
-        if not page_items:
-            break
-
-        all_items.extend(page_items)
-
-        log(
-            f"페이지 {page_no}: {len(page_items)}건 / "
-            f"누적 {len(all_items)}건 / 전체 {total_count}건"
-        )
-
-        if total_count and len(all_items) >= total_count:
-            break
-
-        if len(page_items) < NUM_OF_ROWS:
-            break
-
-        page_no += 1
-        time.sleep(0.3)
-
-    return all_items
-
-
-def get_area_code(item):
-    try:
-        return int(item.get("bidArea"))
-    except (TypeError, ValueError):
-        return None
-
-
-def is_target_area(item):
-    return get_area_code(item) in TARGET_AREAS
-
-
-def is_elevator(item):
-    classify_type3 = str(
-        item.get("codeClassifyType3") or ""
-    ).strip()
-
-    if classify_type3 in ELEVATOR_TYPE3:
-        return True
-
-    title = str(item.get("bidTitle") or "").lower()
-
-    return any(
-        keyword.lower() in title
-        for keyword in ELEVATOR_KEYWORDS
-    )
-
-
-def get_notice_id(item):
-    for key in ["bidNum", "bidNo", "pblancNo"]:
-        value = item.get(key)
-
-        if value is not None and str(value).strip():
-            return str(value).strip()
-
-    return ""
-
-
-def unique_target_items(all_items):
-    unique_items = {}
-
-    for item in all_items:
-        if not is_target_area(item):
-            continue
-
-        if not is_elevator(item):
-            continue
-
-        notice_id = get_notice_id(item)
-
-        if notice_id:
-            unique_items[notice_id] = item
-
-    return list(unique_items.values())
-
-
-def get_area_name(item):
-    area_code = get_area_code(item)
-
-    if area_code is None:
-        return "지역 미확인"
-
-    return AREA_NAME.get(area_code, str(area_code))
-
-
-def build_detail_url(item):
-    return (
-        "https://www.k-apt.go.kr/bid/bidDetail.do?bidNum="
-        + urllib.parse.quote(get_notice_id(item))
-    )
-
-
-def build_message(item):
-    state_code = str(item.get("bidState") or "").strip()
-
-    state_name = STATE_NAME.get(
-        state_code,
-        state_code if state_code else "상태 미확인",
-    )
-
-    title = html.escape(
-        str(item.get("bidTitle") or "제목 없음")
-    )
-
-    apartment_name = html.escape(
-        str(item.get("bidKaptname") or "단지명 없음")
-    )
-
-    registration_date = html.escape(
-        str(item.get("bidRegDate") or "미확인")
-    )
-
-    deadline = html.escape(
-        str(item.get("bidDeadline") or "미확인")
-    )
-
-    bid_num = html.escape(
-        get_notice_id(item) or "번호 없음"
-    )
-
-    emergency = (
-        " ⚠️ 긴급공고"
-        if str(item.get("bidEmrgYn") or "").upper() == "Y"
-        else ""
-    )
-
-    detail_url = html.escape(
-        build_detail_url(item),
-        quote=True,
-    )
-
-    return "\n".join([
-        "🛗 <b>K-APT 승강기 공고 알림</b>",
-        "",
-        f"📍 지역: <b>{get_area_name(item)}</b>",
-        f"🏢 단지: {apartment_name}",
-        f"📌 공고명: {title}{emergency}",
-        f"📄 공고번호: {bid_num}",
-        f"📋 상태: {html.escape(state_name)}",
-        f"📅 공고일: {registration_date}",
-        f"⏰ 마감일: {deadline}",
-        "",
-        f'🔗 <a href="{detail_url}">K-APT 상세보기</a>',
-    ])
-
-
-def send_telegram(text):
-    url = (
-        f"https://api.telegram.org/"
-        f"bot{TG_TOKEN}/sendMessage"
-    )
-
-    payload = urllib.parse.urlencode({
-        "chat_id": TG_CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": "true",
-    }).encode("utf-8")
-
-    request = urllib.request.Request(
-        url,
-        data=payload,
-        headers={
-            "User-Agent": "kapt-elevator-bot/4.0",
-        },
-    )
-
-    last_error = None
-
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            with urllib.request.urlopen(
-                request,
-                timeout=30,
-            ) as response:
-                result = json.loads(
-                    response.read().decode("utf-8")
-                )
-
-            if not result.get("ok"):
-                raise RuntimeError(
-                    f"텔레그램 응답 오류: {result}"
-                )
-
-            return
-
-        except Exception as error:
-            last_error = error
-            log(
-                f"텔레그램 발송 실패 "
-                f"({attempt}/{MAX_RETRIES}): {error}"
-            )
-
-            if attempt < MAX_RETRIES:
-                time.sleep(attempt * 3)
-
-    raise RuntimeError(
-        f"텔레그램 발송 최종 실패: {last_error}"
-    )
-
-
-def validate_environment():
-    missing = []
-
-    if not SERVICE_KEY:
-        missing.append("KAPT_SERVICE_KEY")
-
-    if not TG_TOKEN:
-        missing.append("TELEGRAM_BOT_TOKEN")
-
-    if not TG_CHAT_ID:
-        missing.append("TELEGRAM_CHAT_ID")
-
-    if missing:
-        log(
-            "환경변수가 비어 있습니다: "
-            + ", ".join(missing)
-        )
-        sys.exit(1)
-
-
-def main():
-    validate_environment()
-
-    today = datetime.date.today()
-
-    start_date = (
-        today - datetime.timedelta(days=LOOKBACK_DAYS)
-    ).strftime("%Y-%m-%d")
-
-    end_date = today.strftime("%Y-%m-%d")
-
-    log("K-APT 공고 조회 시작")
-    log(f"조회 기간: {start_date} ~ {end_date}")
-
-    sent, sent_file_exists = load_sent()
-
-    all_items = fetch_all(start_date, end_date)
-    target_items = unique_target_items(all_items)
-
-    current_ids = {
-        get_notice_id(item)
-        for item in target_items
-        if get_notice_id(item)
-    }
-
-    log(f"부산·경남 승강기 공고: {len(target_items)}건")
-    log(f"기존 발송 기록: {len(sent)}건")
-
-    # sent_notice.json이 없거나 읽지 못한 경우
-    # 현재 공고를 기준값으로만 저장하고 발송하지 않는다.
-    if not sent_file_exists:
-        save_sent(current_ids)
-
-        log(
-            f"최초 실행: 기존 공고 "
-            f"{len(current_ids)}건을 기준값으로 저장"
-        )
-        log("기존 공고는 발송하지 않음")
-        return
-
-    new_items = [
-        item
-        for item in target_items
-        if get_notice_id(item) not in sent
-    ]
-
-    new_items.sort(
-        key=lambda item: (
-            str(item.get("bidRegDate") or ""),
-            get_notice_id(item),
-        )
-    )
-
-    log(f"신규 미발송 공고: {len(new_items)}건")
-
-    sent_count = 0
-
-    for item in new_items:
-        notice_id = get_notice_id(item)
-        title = str(
-            item.get("bidTitle") or "제목 없음"
-        )
-
-        if notice_id in sent:
-            continue
-
-        try:
-            send_telegram(build_message(item))
-
-            sent.add(notice_id)
-            save_sent(sent)
-
-            sent_count += 1
-
-            log(
-                f"발송 완료: "
-                f"{title} / {notice_id}"
-            )
-
-            time.sleep(1)
-
-        except Exception as error:
             log(
                 f"발송 실패: "
                 f"{title} / {error}"
             )
 
-    log(f"이번 실행 발송: {sent_count}건")
-    log("실행 종료")
+    log(
+        f"이번 실행 발송: "
+        f"{sent_count}건"
+    )
+
+    log(
+        "K-APT WEB 방식 실행 종료"
+    )
 
 
 if __name__ == "__main__":
